@@ -1,0 +1,161 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Mars rover - live data and control</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+*{box-sizing:border-box}
+body{font-family:system-ui,sans-serif;background:#1b1210;color:#f0dccf;margin:0;padding:12px}
+#top{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px}
+h1{font-size:20px;margin:0 8px 0 0}
+.badge{padding:5px 10px;border-radius:14px;background:#3a2820;font-size:13px}
+.auto{background:#1f6b2f}.manual{background:#9a5a12}.stop{background:#a01818}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px}
+.card{background:#2a1c17;border:1px solid #5a3a2c;border-radius:8px;padding:10px}
+.card h2{font-size:14px;margin:0 0 8px;color:#ffb27a}
+pre{margin:0;font-size:12px;white-space:pre-wrap;max-height:260px;overflow:auto}
+img,canvas{max-width:100%;border-radius:6px;background:#000;display:block;margin:auto}
+button{background:#7a3b1d;color:#fff;border:0;border-radius:6px;padding:10px 14px;font-size:15px;cursor:pointer;touch-action:none;user-select:none}
+button:active{background:#c45a2a}
+button.big{background:#a01818;font-weight:bold;padding:10px 22px}
+.sel{outline:3px solid #7ff07f}
+.dpad{display:grid;grid-template-columns:repeat(3,64px);grid-auto-rows:56px;gap:6px;justify-content:center;margin:10px 0}
+.dpad button{padding:0;font-size:20px}
+label{display:block;font-size:13px;margin:6px 0}
+input[type=range]{width:100%}
+.hint{font-size:12px;color:#c9a88f;margin-top:6px;line-height:1.5}
+#toast{font-size:12px;color:#7ff07f;min-height:16px}
+</style></head><body>
+<div id="top">
+  <h1>Mars rover</h1>
+  <span class="badge">server: <input id="srv" size="28" style="background:#1b1210;color:#f0dccf;border:1px solid #5a3a2c;border-radius:4px;padding:3px" onkeydown="event.stopPropagation()"> <button style="padding:3px 10px;font-size:13px" onclick="saveServer()">Connect</button></span>
+  <span id="mode" class="badge">mode: ?</span>
+  <span id="state" class="badge">avoider: ?</span>
+  <span id="conn" class="badge">connecting...</span>
+  <button class="big" onclick="setMode('stop')">STOP (space)</button>
+</div>
+<div class="grid">
+  <div class="card"><h2>Drive control</h2>
+    <div>
+      <button id="b-auto" onclick="setMode('auto')">AUTO (1)</button>
+      <button id="b-manual" onclick="setMode('manual')">MANUAL (2)</button>
+      <button id="b-stop" onclick="setMode('stop')">STOP</button>
+    </div>
+    <label>Speed: <b id="sv">0.30</b> m/s <input id="sp" type="range" min="0.1" max="0.6" step="0.05" value="0.3" oninput="speed=+this.value;sv.textContent=speed.toFixed(2)" onchange="this.blur()"></label>
+    <label>Turn rate: <b id="tv">0.80</b> rad/s <input id="tr" type="range" min="0.2" max="1.5" step="0.1" value="0.8" oninput="turn=+this.value;tv.textContent=turn.toFixed(2)" onchange="this.blur()"></label>
+    <div class="dpad">
+      <button data-f="1" data-a="1">&#8598;</button><button data-f="1" data-a="0">&#9650;</button><button data-f="1" data-a="-1">&#8599;</button>
+      <button data-f="0" data-a="1">&#9664;</button><button onclick="setMode('stop')">&#9632;</button><button data-f="0" data-a="-1">&#9654;</button>
+      <button data-f="-1" data-a="1">&#8601;</button><button data-f="-1" data-a="0">&#9660;</button><button data-f="-1" data-a="-1">&#8600;</button>
+    </div>
+    <div class="hint">Hold a button, or use the keyboard: W/A/S/D or arrow keys to drive (hold), Space = STOP, 1 = AUTO, 2 = MANUAL.
+    Pressing a drive key while in AUTO switches to MANUAL for you.</div>
+    <div id="toast"></div>
+  </div>
+  <div class="card"><h2>Camera</h2><img id="cam"></div>
+  <div class="card"><h2>SLAM map (builds as the rover moves)</h2><img id="map"></div>
+  <div class="card"><h2>Lidar radar (top view, forward = up)</h2><canvas id="radar" width="360" height="360"></canvas></div>
+  <div class="card"><h2>Obstacle avoider</h2><pre id="obstacle"></pre></div>
+  <div class="card"><h2>Lidar summary</h2><pre id="scan"></pre></div>
+  <div class="card"><h2>IMU</h2><pre id="imu"></pre></div>
+  <div class="card"><h2>Fused odometry (EKF)</h2><pre id="fused_odom"></pre></div>
+  <div class="card"><h2>Raw wheel odometry</h2><pre id="odom"></pre></div>
+  <div class="card"><h2>Velocity command</h2><pre id="cmd_vel"></pre></div>
+  <div class="card"><h2>Map info</h2><pre id="map_info"></pre></div>
+  <div class="card"><h2>Topic rates (wall-clock Hz)</h2><pre id="rates"></pre></div>
+</div>
+<script>
+let BASE = '';
+let speed = 0.3, turn = 0.8, mode = '?', driveTimer = null, keys = new Set();
+const $ = id => document.getElementById(id);
+function toast(t){ $('toast').textContent = t; }
+const _q = new URLSearchParams(location.search).get('server');
+let _saved = null; try { _saved = localStorage.getItem('roverServer'); } catch (e) {}
+BASE = (_q || _saved || 'http://localhost:8080').replace(/\/$/, '');
+$('srv').value = BASE;
+function saveServer(){
+  BASE = $('srv').value.trim().replace(/\/$/, '');
+  try { localStorage.setItem('roverServer', BASE); } catch (e) {}
+  toast('server address: ' + BASE); refreshImages(); tick();
+}
+
+function setMode(m){
+  fetch(BASE + '/api/mode?set=' + m).then(r => {
+    if (r.status === 403){ toast('control is disabled on this server (read-only)'); return; }
+    mode = m; showMode(); toast('mode set to ' + m);
+  }).catch(() => toast('server not reachable'));
+}
+function showMode(){
+  $('mode').textContent = 'mode: ' + mode;
+  $('mode').className = 'badge ' + (['auto','manual','stop'].includes(mode) ? mode : '');
+  for (const m of ['auto','manual','stop']) $('b-' + m).classList.toggle('sel', m === mode);
+}
+function sendDrive(f, a){ fetch(BASE + '/api/drive?lin=' + (f * speed) + '&ang=' + (a * turn)).catch(() => {}); }
+function setDrive(f, a){
+  if (driveTimer){ clearInterval(driveTimer); driveTimer = null; }
+  if (!f && !a){ sendDrive(0, 0); return; }
+  if (mode !== 'manual') setMode('manual');
+  sendDrive(f, a);
+  driveTimer = setInterval(() => sendDrive(f, a), 150);
+}
+// on-screen buttons
+document.querySelectorAll('.dpad button[data-f]').forEach(b => {
+  const f = +b.dataset.f, a = +b.dataset.a;
+  b.addEventListener('pointerdown', e => { e.preventDefault(); setDrive(f, a); });
+  for (const ev of ['pointerup','pointerleave','pointercancel']) b.addEventListener(ev, () => setDrive(0, 0));
+});
+// keyboard
+function keyDrive(){
+  const f = (keys.has('w') || keys.has('arrowup') ? 1 : 0) - (keys.has('s') || keys.has('arrowdown') ? 1 : 0);
+  const a = (keys.has('a') || keys.has('arrowleft') ? 1 : 0) - (keys.has('d') || keys.has('arrowright') ? 1 : 0);
+  setDrive(f, a);
+}
+const DRIVE_KEYS = ['w','a','s','d','arrowup','arrowdown','arrowleft','arrowright'];
+addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (k === ' ' ){ e.preventDefault(); keys.clear(); if (driveTimer){ clearInterval(driveTimer); driveTimer = null; } setMode('stop'); return; }
+  if (k === '1'){ keys.clear(); setDrive(0, 0); setMode('auto'); return; }
+  if (k === '2'){ setMode('manual'); return; }
+  if (DRIVE_KEYS.includes(k)){ e.preventDefault(); if (!keys.has(k)){ keys.add(k); keyDrive(); } }
+});
+addEventListener('keyup', e => {
+  const k = e.key.toLowerCase();
+  if (DRIVE_KEYS.includes(k)){ keys.delete(k); keyDrive(); }
+});
+addEventListener('blur', () => { keys.clear(); setDrive(0, 0); });
+
+// lidar radar
+function drawRadar(ranges){
+  const c = $('radar'), g = c.getContext('2d'), S = c.width, cx = S / 2, cy = S / 2, R = S / 2 - 12, MAXR = 12;
+  g.clearRect(0, 0, S, S); g.fillStyle = '#0b0807'; g.fillRect(0, 0, S, S);
+  g.strokeStyle = '#4a3a30'; g.fillStyle = '#8a7568'; g.font = '10px sans-serif';
+  for (const r of [2, 4, 6, 8, 10, 12]){ g.beginPath(); g.arc(cx, cy, r / MAXR * R, 0, 7); g.stroke(); g.fillText(r + 'm', cx + 2, cy - r / MAXR * R + 10); }
+  g.beginPath(); g.moveTo(cx, cy - R); g.lineTo(cx, cy + R); g.moveTo(cx - R, cy); g.lineTo(cx + R, cy); g.stroke();
+  if (ranges){
+    const n = ranges.length;
+    for (let i = 0; i < n; i++){
+      const r = ranges[i]; if (r === null || r === undefined) continue;
+      const ang = -Math.PI + i * 2 * Math.PI / n;
+      const x = cx - r * Math.sin(ang) / MAXR * R, y = cy - r * Math.cos(ang) / MAXR * R;
+      g.fillStyle = r < 1 ? '#ff4040' : (r < 2 ? '#ffa030' : '#50e070');
+      g.fillRect(x - 1.5, y - 1.5, 3, 3);
+    }
+  }
+  g.fillStyle = '#ffb27a'; g.beginPath(); g.moveTo(cx, cy - 10); g.lineTo(cx - 6, cy + 7); g.lineTo(cx + 6, cy + 7); g.closePath(); g.fill();
+}
+drawRadar(null);
+
+async function tick(){
+  try {
+    const d = await (await fetch(BASE + '/api/all?full=1')).json();
+    $('conn').textContent = 'connected'; $('conn').className = 'badge auto';
+    if (d.drive_mode && d.drive_mode !== 'unknown'){ mode = d.drive_mode; showMode(); }
+    const hide = (k, v) => (k === 'ranges' || k === 'ranges_downsampled') ? undefined : v;
+    for (const k of ['obstacle','scan','imu','fused_odom','odom','cmd_vel','rates']){
+      $(k).textContent = d[k] ? JSON.stringify(d[k], hide, 1) : 'waiting for data...';
+    }
+    $('map_info').textContent = d.map ? JSON.stringify(d.map, null, 1) : 'waiting for /map...';
+    $('state').textContent = 'avoider: ' + (d.obstacle ? d.obstacle.state : '?');
+    drawRadar(d.scan ? d.scan.ranges : null);
+  } catch (e) { $('conn').textContent = 'no connection'; $('conn').className = 'badge stop'; }
+}
+function refreshImages(){ const t = Date.now(); $('cam').src = BASE + '/camera.png?' + t; $('map').src = BASE + '/map.png?' + t; }
+setInterval(tick, 500); setInterval(refreshImages, 1000); tick(); refreshImages();
+</script></body></html>
